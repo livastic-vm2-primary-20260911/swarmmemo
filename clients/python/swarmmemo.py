@@ -9,6 +9,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -514,7 +515,14 @@ def strict_json(raw):
             result[key] = value
         return result
     def constant(_): raise ValueError("invalid_json_number")
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    def floating(text):
+        # JSON permits exponent notation; Python converts 1e999 to infinity,
+        # even when parse_constant rejects literal NaN and Infinity.
+        value = float(text)
+        if not math.isfinite(value): raise ValueError("invalid_json_number")
+        return value
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant,
+                      parse_float=floating)
 
 
 def delegation_context(value):
@@ -4471,8 +4479,14 @@ class Chat:
             for pair in self.args.pairs:
                 key, sep, raw = pair.partition("=")
                 if not sep or key not in PROTECT_KEYS: raise ChatStop(1, f"chat protect set takes KEY=VALUE, KEY one of {', '.join(PROTECT_KEYS)}")
-                try: value = json.loads(raw)
-                except ValueError: value = raw.split(",") if key == "inbound.categories" else raw
+                try: value = strict_json(raw)
+                except ValueError:
+                    # Keep plain KEY=server and comma-separated categories.
+                    # But a malformed object/array is never a policy string:
+                    # fail closed instead of forwarding ambiguous JSON.
+                    if raw.lstrip().startswith(("{", "[")) or raw.strip() in ("NaN", "Infinity", "-Infinity"):
+                        raise ChatStop(1, "invalid_json_protection_value") from None
+                    value = raw.split(",") if key == "inbound.categories" else raw
                 section, _, name = key.rpartition(".")
                 {"inbound": inbound, "outbound": outbound, "": extra}[section][name] = value
             self.set_messaging(**({"inbound": inbound} if inbound else {}), **({"outbound": outbound} if outbound else {}), **extra)
@@ -5229,7 +5243,7 @@ def build_parser():
     witness.add_argument("agent", help="the linking agent's fingerprint"); witness.add_argument("kind"); witness.add_argument("value")
     witness.add_argument("--nonce", required=True, help="the challenge you used in your check, 16-128 characters")
     witness.add_argument("--verdict", required=True, choices=["verified", "failed"])
-    witness.add_argument("--checks", type=json.loads, help='optional JSON list of what you checked, per property: [{"property":"signature","state":"pass"}]; /protocol.md#verdict-checks')
+    witness.add_argument("--checks", type=strict_json, help='optional JSON list of what you checked, per property: [{"property":"signature","state":"pass"}]; /protocol.md#verdict-checks')
     add_data_options(witness, "identity.witness")
     rotate = commands.add_parser("rotate"); rotate.add_argument("new_key", type=Path)
     upload = commands.add_parser("upload"); upload.add_argument("room"); upload.add_argument("path", type=Path)
@@ -5340,7 +5354,8 @@ def main(argv=None):
                 result = client.command("ledger.list", **{k: v for k, v in fields.items() if v is not None})
             elif args.action == "services": result = client.command("services.list")
             elif args.action == "call":
-                call_args = json.loads(args.args)
+                # Legacy service-method invocation is cost-limited too.
+                call_args = strict_json(args.args)
                 if not isinstance(call_args, dict):
                     raise ValueError("args must be a JSON object")
                 result = client.service_method(args.target_service, args.method, call_args, args.max_cost, args.request_id)
